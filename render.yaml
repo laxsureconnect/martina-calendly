@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: martina-calendly
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 30
+    envVars:
+      - key: CALENDLY_TOKEN
+        sync: false                # paste Michael's Personal Access Token in Render
+      - key: EVENT_TYPE_URI
+        value: https://api.calendly.com/event_types/fcc3790b-8dae-46e4-93a8-49cbcfb9d89b
+      - key: LOCATION_KIND
+        value: ""                  # this event type has NO location -> must omit it
+      - key: SHARED_SECRET
+        sync: false                # set any random string; Retell sends it as X-Secret
