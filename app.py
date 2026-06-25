@@ -27,10 +27,10 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 CAL = "https://api.calendly.com"
-LOCATION_KIND = os.environ.get("LOCATION_KIND", "zoom_conference")
+LOCATION_KIND = os.environ.get("LOCATION_KIND", "")  # default OMIT: let each Calendly event use its own configured location
 SHARED_SECRET = os.environ.get("SHARED_SECRET", "")
-MAX_SLOTS = int(os.environ.get("MAX_SLOTS", "18"))
-SLOTS_PER_DAY = int(os.environ.get("SLOTS_PER_DAY", "3"))
+MAX_SLOTS = int(os.environ.get("MAX_SLOTS", "40"))
+SLOTS_PER_DAY = int(os.environ.get("SLOTS_PER_DAY", "8"))
 DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "7"))
 
 # Default (legacy) producer = Michael, from the original env vars.
@@ -168,11 +168,24 @@ def book():
         return jsonify(booked=False, error="producer_not_configured"), 200
     if not (name and email and start_time):
         return jsonify(booked=False, error="missing name, email, or start_time"), 200
-    payload = {"event_type": event_uri, "start_time": start_time,
-               "invitee": {"name": name, "email": email, "timezone": tz}}
-    if LOCATION_KIND:
-        payload["location"] = {"kind": LOCATION_KIND}
-    r = requests.post(f"{CAL}/invitees", headers=_h(token), json=payload, timeout=25)
+    base = {"event_type": event_uri, "start_time": start_time,
+            "invitee": {"name": name, "email": email, "timezone": tz}}
+
+    def _try(payload):
+        return requests.post(f"{CAL}/invitees", headers=_h(token), json=payload, timeout=25)
+
+    # Robust location handling: try WITHOUT a location first (Calendly uses the event's
+    # own configured location). Only if Calendly complains about a MISSING/required
+    # location do we retry WITH zoom_conference. This needs no env/config per producer.
+    attempts = [base]
+    if LOCATION_KIND:  # optional explicit override still honored first
+        attempts = [{**base, "location": {"kind": LOCATION_KIND}}, base]
+    r = _try(attempts[0])
+    if r.status_code not in (200, 201) and "location" in r.text.lower():
+        # flip: if we sent a location, retry without; if we didn't, retry with zoom
+        alt = base if (attempts[0] is not base) else {**base, "location": {"kind": "zoom_conference"}}
+        r = _try(alt)
+
     if r.status_code in (200, 201):
         d = r.json().get("resource", {})
         return jsonify(booked=True, reschedule_url=d.get("reschedule_url"),
