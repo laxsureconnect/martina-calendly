@@ -46,6 +46,13 @@ except Exception:
 
 # in-memory cache of resolved event_type_uris (keyed by producer)
 _URI_CACHE = {}
+# in-memory cache of an event's custom_questions (keyed by event_type_uri)
+_Q_CACHE = {}
+
+# Default text answer for required free-text questions when the agent gives us
+# nothing better. Override per deployment via env if a producer's question needs
+# a specific phrasing.
+DEFAULT_QA_TEXT = os.environ.get("DEFAULT_QA_TEXT", "Veteran benefits walkthrough")
 
 
 def _h(token):
@@ -80,10 +87,68 @@ def _creds(producer):
     return token, uri
 
 
+def _event_questions(token, event_uri):
+    """Return the event type's custom_questions list (cached by event_uri).
+    Each item: {name, type, position, enabled, required, answer_choices, ...}."""
+    if event_uri in _Q_CACHE:
+        return _Q_CACHE[event_uri]
+    qs = []
+    try:
+        r = requests.get(event_uri, headers=_h(token), timeout=20)
+        if r.status_code == 200:
+            qs = (r.json().get("resource") or {}).get("custom_questions") or []
+    except Exception:
+        qs = []
+    _Q_CACHE[event_uri] = qs
+    return qs
+
+
+def _build_qa(token, event_uri, extra):
+    """Build a questions_and_answers list that satisfies every REQUIRED + enabled
+    custom question on the event, so Calendly won't reject with
+    'Required Questions and Answers cannot be blank.'
+
+    Answer source per question type:
+      - single/multiple select -> first available answer choice
+      - phone_number           -> extra['phone'] if the agent passed one (else skipped)
+      - text / anything else   -> extra['notes'] or DEFAULT_QA_TEXT
+
+    Returns (qa_list, unfilled_required_names). unfilled lets the caller know a
+    required question couldn't be answered (e.g. a required phone we don't have)."""
+    qa, unfilled = [], []
+    for q in _event_questions(token, event_uri):
+        if not q.get("enabled", True) or not q.get("required"):
+            continue
+        name = q.get("name") or ""
+        pos = q.get("position", 0)
+        qtype = (q.get("type") or "").lower()
+        choices = q.get("answer_choices") or []
+        if qtype == "phone_number":
+            ans = (extra.get("phone") or "").strip()
+        elif choices:
+            ans = choices[0]
+        else:
+            ans = (extra.get("notes") or "").strip() or DEFAULT_QA_TEXT
+        if not ans:
+            unfilled.append(name)
+            continue
+        qa.append({"question": name, "answer": ans, "position": pos})
+    return qa, unfilled
+
+
 def _args():
     body = request.get_json(silent=True) or {}
     a = body.get("args")
     return a if isinstance(a, dict) else body
+
+
+def _call_obj():
+    """Retell posts the full call context alongside the tool args. We use it to
+    recover the lead's phone for required phone-type questions WITHOUT the LLM
+    having to pass it."""
+    body = request.get_json(silent=True) or {}
+    c = body.get("call")
+    return c if isinstance(c, dict) else {}
 
 
 def _auth_ok():
@@ -177,6 +242,25 @@ def book():
         return jsonify(booked=False, error="missing name, email, or start_time"), 200
     base = {"event_type": event_uri, "start_time": start_time,
             "invitee": {"name": name, "email": email, "timezone": tz}}
+
+    # Recover the lead's phone for any required phone-type question. Prefer an
+    # explicit arg, else the dialed number (call.to_number), else a lead_phone
+    # dynamic variable. No agent/prompt change needed — Retell sends call context.
+    if not (a.get("phone") or "").strip():
+        call = _call_obj()
+        dv = call.get("retell_llm_dynamic_variables") or {}
+        a = {**a, "phone": (call.get("to_number") or dv.get("lead_phone") or "").strip()}
+
+    # Fill any REQUIRED custom questions on the event (Calendly 400s without them).
+    qa, unfilled = _build_qa(token, event_uri, a)
+    if qa:
+        base["questions_and_answers"] = qa
+    if unfilled:
+        # A required question we genuinely can't answer (e.g. required phone, none passed).
+        # Don't pretend success — let the agent fall back to "Lilith will confirm directly."
+        return jsonify(booked=False, error="required_question_unanswered",
+                       detail=f"Event requires answers we don't have: {', '.join(unfilled)}",
+                       message="Couldn't lock the slot — required info missing."), 200
 
     def _try(payload):
         return requests.post(f"{CAL}/invitees", headers=_h(token), json=payload, timeout=25)
