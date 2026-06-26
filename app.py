@@ -131,6 +131,13 @@ def availability():
     if r.status_code != 200:
         return jsonify(error="availability_failed", detail=r.text[:300]), 200
     times = r.json().get("collection", [])
+    today_local = now.astimezone(zone).date()
+    def label(local):
+        # Unambiguous spoken label: today/tomorrow + weekday + date number, so the
+        # agent never offers a bare weekday that could be confused with today.
+        delta = (local.date() - today_local).days
+        prefix = "today, " if delta == 0 else ("tomorrow, " if delta == 1 else "")
+        return prefix + local.strftime("%A %B %-d at %-I:%M %p")
     by_day = {}
     for t in times:
         utc = dt.datetime.fromisoformat(t["start_time"].replace("Z", "+00:00"))
@@ -145,7 +152,7 @@ def availability():
             idxs = sorted({round(i * (n - 1) / (SLOTS_PER_DAY - 1)) for i in range(SLOTS_PER_DAY)})
             picks = [daily[i] for i in idxs]
         for local, start_time in picks:
-            slots.append({"when": local.strftime("%A at %-I:%M %p"), "start_time": start_time})
+            slots.append({"when": label(local), "start_time": start_time})
         if len(slots) >= MAX_SLOTS:
             break
     slots = slots[:MAX_SLOTS]
