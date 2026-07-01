@@ -48,6 +48,8 @@ except Exception:
 _URI_CACHE = {}
 # in-memory cache of an event's custom_questions (keyed by event_type_uri)
 _Q_CACHE = {}
+# in-memory cache of an event's OWN configured location (keyed by event_type_uri)
+_LOC_CACHE = {}
 
 # Default text answer for required free-text questions when the agent gives us
 # nothing better. Override per deployment via env if a producer's question needs
@@ -101,6 +103,38 @@ def _event_questions(token, event_uri):
         qs = []
     _Q_CACHE[event_uri] = qs
     return qs
+
+
+def _event_location(token, event_uri):
+    """Return the event type's OWN configured location as a booking-payload dict,
+    so we book with whatever the producer set up — zoom_conference (auto Zoom),
+    a custom location (e.g. a fixed personal Zoom link), google_conference, a
+    physical address, etc. Cached by event_uri. Returns None if none/unknown.
+
+    Fixes the case where a producer's event uses a custom location: passing the
+    generic zoom_conference kind gets rejected ('location kind not configured'),
+    so we must echo the event's real location kind (and text, for custom)."""
+    if event_uri in _LOC_CACHE:
+        return _LOC_CACHE[event_uri]
+    loc = None
+    try:
+        r = requests.get(event_uri, headers=_h(token), timeout=20)
+        if r.status_code == 200:
+            res = r.json().get("resource") or {}
+            locs = res.get("locations") or ([res["location"]] if res.get("location") else [])
+            for L in locs:
+                kind = L.get("kind")
+                if not kind:
+                    continue
+                if kind == "custom":
+                    loc = {"kind": "custom", "location": L.get("location") or ""}
+                else:
+                    loc = {"kind": kind}
+                break
+    except Exception:
+        loc = None
+    _LOC_CACHE[event_uri] = loc
+    return loc
 
 
 def _build_qa(token, event_uri, extra):
@@ -265,17 +299,16 @@ def book():
     def _try(payload):
         return requests.post(f"{CAL}/invitees", headers=_h(token), json=payload, timeout=25)
 
-    # Robust location handling: try WITHOUT a location first (Calendly uses the event's
-    # own configured location). Only if Calendly complains about a MISSING/required
-    # location do we retry WITH zoom_conference. This needs no env/config per producer.
-    attempts = [base]
-    if LOCATION_KIND:  # optional explicit override still honored first
-        attempts = [{**base, "location": {"kind": LOCATION_KIND}}, base]
-    r = _try(attempts[0])
+    # Location handling: book with the event's OWN configured location so it works for
+    # every producer's setup (auto Zoom, a custom personal Zoom link, Google Meet, a
+    # physical address, etc.). An explicit LOCATION_KIND env still overrides. If the
+    # chosen location is rejected, fall back to no-location then generic zoom_conference.
+    own_loc = ({"kind": LOCATION_KIND} if LOCATION_KIND else _event_location(token, event_uri))
+    r = _try({**base, "location": own_loc} if own_loc else base)
     if r.status_code not in (200, 201) and "location" in r.text.lower():
-        # flip: if we sent a location, retry without; if we didn't, retry with zoom
-        alt = base if (attempts[0] is not base) else {**base, "location": {"kind": "zoom_conference"}}
-        r = _try(alt)
+        r = _try(base)  # let Calendly use the event default
+        if r.status_code not in (200, 201) and "location" in r.text.lower():
+            r = _try({**base, "location": {"kind": "zoom_conference"}})
 
     if r.status_code in (200, 201):
         d = r.json().get("resource", {})
@@ -285,6 +318,34 @@ def book():
         return jsonify(booked=False, error="slot_taken",
                        message="That time was just taken — offer another slot."), 200
     return jsonify(booked=False, error=f"calendly_{r.status_code}", detail=r.text[:300]), 200
+
+
+@app.post("/cancel")
+def cancel():
+    """Cancel active scheduled events for a producer by invitee email.
+    Body: { producer, email, reason? }. Cancels ALL active events for that invitee on
+    that producer's calendar (test cleanup + ops). Scoped to one email = safe."""
+    if not _auth_ok():
+        return jsonify(error="unauthorized"), 401
+    a = _args()
+    token, _ = _creds(a.get("producer"))
+    email = (a.get("email") or "").strip()
+    reason = (a.get("reason") or "automated cancellation").strip()
+    if not token:
+        return jsonify(error="producer_not_configured"), 200
+    if not email:
+        return jsonify(error="missing email"), 200
+    me = requests.get(f"{CAL}/users/me", headers=_h(token), timeout=20).json()["resource"]
+    params = {"user": me["uri"], "invitee_email": email, "status": "active", "count": 50}
+    evs = requests.get(f"{CAL}/scheduled_events", headers=_h(token),
+                       params=params, timeout=20).json().get("collection", [])
+    cancelled = []
+    for e in evs:
+        rc = requests.post(f"{e['uri']}/cancellation", headers=_h(token),
+                           json={"reason": reason}, timeout=20)
+        cancelled.append({"start_time": e.get("start_time"), "http": rc.status_code})
+    return jsonify(producer=a.get("producer"), email=email,
+                   found=len(evs), cancelled=cancelled), 200
 
 
 if __name__ == "__main__":
